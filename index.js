@@ -1,38 +1,29 @@
-var Filter = require('broccoli-persistent-filter')
-var path = require('path')
-var eslint = require('eslint')
-var defaults = require('defaults')
-var minimatch = require('minimatch')
-var stringify = require('json-stable-stringify')
-var crypto = require('crypto')
 var Linter = require('./lib/linter')
+var standardOpts = require('standard/options')
+var extend = require('extend')
+var path = require('path')
+var chalk = require('chalk')
+var Filter = require('broccoli-persistent-filter')
+var crypto = require('crypto')
+var stringify = require('json-stable-stringify')
 
-var jsStringEscape = require('js-string-escape')
+Standard.prototype = Object.create(Filter.prototype)
+Standard.prototype.constructor = Standard
+function Standard (inputNode, options) {
+  if (!(this instanceof Standard)) return new Standard(inputNode, options)
 
-function _makeDictionary () {
-  var cache = Object.create(null)
-  cache['_dict'] = null
-  delete cache['_dict']
-  return cache
-}
-
-var StandardFilter = function (inputTree, _options) {
-  if (!(this instanceof StandardFilter)) { return new StandardFilter(inputTree, _options) }
-
-  var options = _options || {}
+  options = options || {}
   if (!options.hasOwnProperty('persist')) {
     options.persist = true
   }
 
-  this.name = "TEST"
-
-  Filter.call(this, inputTree, options)
-
+  Filter.call(this, inputNode, {
+    annotation: options.annotation,
+    persist: options.persist
+  })
+  this.log = true
   this.options = options
-  this.inputTree = inputTree
-  this.enabled = true
-
-  this._excludeFileCache = _makeDictionary()
+  this.console = console
 
   for (var key in options) {
     if (options.hasOwnProperty(key)) {
@@ -41,133 +32,111 @@ var StandardFilter = function (inputTree, _options) {
   }
 }
 
-StandardFilter.prototype = Object.create(Filter.prototype)
-StandardFilter.prototype.constructor = StandardFilter
-StandardFilter.prototype.extensions = ['js']
-StandardFilter.prototype.targetExtension = 'js'
+Standard.prototype.extensions = ['js']
+Standard.prototype.targetExtension = 'standard.js'
 
-StandardFilter.prototype.baseDir = function () {
+Standard.prototype.baseDir = function () {
   return __dirname
 }
 
-StandardFilter.prototype.build = function () {
-  this.configure()
+Standard.prototype.build = function () {
+  this._errors = []
+
+  this.standardLinter = new Linter(extend(true, standardOpts, this.options))
+
   return Filter.prototype.build.call(this)
+    .finally(() => {
+      var ec = this._errors.length
+      if (ec > 0) {
+        var label = 'Standard Style Error' + (ec > 1 ? 's' : '')
+        this.console.log(`
+ ${this._errors.join('\n')}`)
+        this.console.log(chalk.yellow(`===== ${ec} ${label}
+`))
+      }
+    })
 }
 
-StandardFilter.prototype.configure = function () {
-  if (this.enabled) {
-    var options = defaults(this.options, {
-      eslint: eslint
-    })
-    options.eslintConfig = defaults(options.eslintConfig, {
-      "extends": [ "standard" ]
-    })
-    this.standardLinter = new Linter(options)
+Standard.prototype.processString = function (content, relativePath) {
+  var info = this.standardLinter.lintTextSync(content)
+  var passed = info.errorCount === 0
+  var messages = info.results.reduce((a, r) => {
+    return a.concat(r.messages)
+  }, [])
+  var errors = this.processErrors(relativePath, messages)
 
-  // this.bypass = Object.keys(this.rules).length === 0
-  // if (!this.bypass) {
-  //
-  //   var checker = new jscs()
-  //   checker.registerDefaultRules()
-  //   checker.configure(this.rules)
-  //   this.checker = checker
-  //
-  //   if (!this.disableTestGenerator) {
-  //     this.targetExtension = 'standard-test.js'
-  //   }
-  // }
+  var output = ''
+  if (!this.disableTestGenerator) {
+    output = this.testGenerator(relativePath, passed, errors)
+  }
+
+  return {
+    output: output,
+    passed: passed,
+    errors: errors
   }
 }
 
-StandardFilter.prototype.processString = function (content, relativePath) {
-  if (this.enabled && !this.bypass) {
-    if (this.shouldExcludeFile(relativePath)) {
-      return this.disableTestGenerator ? content : ''
-    }
+Standard.prototype.postProcess = function (results) {
+  var errors = results.errors
+  var passed = results.passed
 
-    var results = this.standardLinter.lintTextSync(content)
-
-    var errorText = this.processErrors(results, relativePath)
-    if (errorText) {
-      this.logError(errorText)
-    }
-
-    if (!this.disableTestGenerator) {
-      errorText = this.processErrors(results, false)
-      return this.testGenerator(relativePath, errorText)
-    }
+  if (this.failOnAnyError && errors.length > 0) {
+    var generalError = new Error('Standard failed')
+    generalError.jshintErrors = errors
+    throw generalError
   }
 
-  return content
+  if (!passed && this.log) {
+    this.logError(errors)
+  }
+
+  return results
 }
 
-StandardFilter.prototype.processErrors = function (results, relativePath) {
-  return results.results
-    .reduce((a, file) => {
-      var m = file.messages.map((e) => `${relativePath} [${e.line}:${e.column}]: ${e.message}`)
-      return a.concat(m)
-    }, [])
-    .join('\n')
+Standard.prototype.processErrors = function (file, errors) {
+  if (!errors || !errors.length) return ''
+  var errStrings = errors.map(function (e) {
+    return `${file}: [${e.line}:${e.column}] ${e.message}`
+  })
+  var len = errStrings.length
+  var label = `${len} error${len > 1 ? 's' : ''}`
+  return errStrings.join('\n') + '\n' + label
 }
 
-StandardFilter.prototype.testGenerator = function (relativePath, errors) {
+Standard.prototype.testGenerator = function (relativePath, passed, errors) {
   if (errors) {
-    errors = this.escapeErrorString('\n' + errors)
+    errors = '\\n' + this.escapeErrorString(errors)
+  } else {
+    errors = ''
   }
 
-  return "module('Standard - " + path.dirname(relativePath) + "');\n" +
-  "test('" + relativePath + " should pass standard', function() {\n" +
-  '  ok(' + !errors + ", '" + relativePath + ' should pass standard.' + errors + "');\n" +
+  return '' +
+  "QUnit.module('Standard - " + path.dirname(relativePath) + "');\n" +
+  "QUnit.test('" + relativePath + " should pass standard', function(assert) { \n" +
+  '  assert.expect(1);\n' +
+  '  assert.ok(' + !!passed + ", '" + relativePath + ' should pass standard.' + errors + "'); \n" +
   '});\n'
 }
 
-StandardFilter.prototype.logError = function (message) {
-  console.error(message)
+Standard.prototype.logError = function (message, color) {
+  color = color || 'red'
+
+  this._errors.push(chalk[color](message) + '\n')
 }
 
-StandardFilter.prototype.escapeErrorString = jsStringEscape
+Standard.prototype.escapeErrorString = function (string) {
+  string = string.replace(/\n/gi, '\\n')
+  string = string.replace(/'/gi, "\\'")
 
-StandardFilter.prototype.shouldExcludeFile = function (relativePath) {
-  if (this.excludeFiles) {
-    // The user specified an "excludeFiles" list.
-    // Must pattern match or find a cache hit to determine if this relativePath is an actual JSCS exclusion.
-    var excludeFileCache = this._excludeFileCache
-
-    if (excludeFileCache[relativePath] !== undefined) {
-      // This relativePath is in the cache, so we've already run minimatch.
-      return excludeFileCache[relativePath]
-    }
-
-    var i, l, pattern
-
-    // This relativePath is NOT in the cache. Execute _matchesPattern().
-    for (i = 0, l = this.excludeFiles.length; i < l; i++) {
-      pattern = this.excludeFiles[i]
-      if (this._matchesPattern(relativePath, pattern)) {
-        // User has specified "excludeFiles" and this relativePath did match at least 1 exclusion.
-        excludeFileCache[relativePath] = true
-        return
-      }
-    }
-
-    // User has specified excludeFiles but this relativePath did NOT match any exclusions.
-    excludeFileCache[relativePath] = false
-  }
-
-  // The user has NOT specified an "excludeFiles" list. Continue processing like normal.
-  return false
+  return string
 }
 
-StandardFilter.prototype._matchesPattern = function (relativePath, pattern) {
-  return minimatch(relativePath, pattern)
-}
-
-StandardFilter.prototype.optionsHash = function () {
+Standard.prototype.optionsHash = function () {
   if (!this._optionsHash) {
     this._optionsHash = crypto.createHash('md5')
       .update(stringify(this.options), 'utf8')
-      .update(stringify(this.rules) || '', 'utf8')
+      .update(stringify(this.jshintrc) || '', 'utf8')
       .update(this.testGenerator.toString(), 'utf8')
       .update(this.logError.toString(), 'utf8')
       .update(this.escapeErrorString.toString(), 'utf8')
@@ -177,8 +146,8 @@ StandardFilter.prototype.optionsHash = function () {
   return this._optionsHash
 }
 
-StandardFilter.prototype.cacheKeyProcessString = function (string, relativePath) {
+Standard.prototype.cacheKeyProcessString = function (string, relativePath) {
   return this.optionsHash() + Filter.prototype.cacheKeyProcessString.call(this, string, relativePath)
 }
 
-module.exports = StandardFilter
+module.exports = Standard

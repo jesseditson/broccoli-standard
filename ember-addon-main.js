@@ -1,67 +1,56 @@
-var StandardFilter = require('./index')
-var mergeTrees = require('broccoli-merge-trees')
-var Funnel = require('broccoli-funnel')
-var jsStringEscape = require('js-string-escape')
+var standardTrees = require('./index');
 
 module.exports = {
   name: 'broccoli-standard',
 
-  isDevelopingAddon: function() {
-    return true;
-  },
+  buildConsole: function() {
+    var ui = this.ui;
 
-  lintTree: function (type, tree) {
-    var standardOptions = this.app.options.standardOptions || {}
-
-    if (standardOptions.disabled) {
-      return tree
+    if (!ui) {
+      this.console = console;
+      return;
     }
 
-    var project = this.project
-    if (!standardOptions.testGenerator && project.generateTestFile) {
-      standardOptions.testGenerator = function (relativePath, errors) {
+    this.console = {
+      log: function(data) {
+        ui.writeLine(data);
+      },
+
+      error: function(data) {
+        ui.writeLine(data, 'ERROR');
+      }
+    };
+  },
+
+  init: function() {
+    this.buildConsole();
+  },
+
+  included: function included(app, parentAddon) {
+    this._super.included.call(this, app, parentAddon);
+    this.standardConfig = app.options.standard || {};
+  },
+
+  lintTree: function(type, tree) {
+    var project = this.project;
+
+    return standardTrees(tree, {
+      options: this.standardConfig,
+      description: 'Standard ' +  type,
+      console: this.console,
+      testGenerator: function(relativePath, passed, errors) {
         if (errors) {
-          errors = jsStringEscape('\n' + errors)
+          errors = "\\n" + this.escapeErrorString(errors);
+        } else {
+          errors = "";
         }
 
         return project.generateTestFile('Standard - ' + relativePath, [{
           name: 'should pass standard',
-          passed: !errors,
+          passed: !!passed,
           errorMessage: relativePath + ' should pass standard.' + errors
-        }])
+        }]);
       }
-    }
-
-    var standardTree = new StandardFilter(tree, standardOptions)
-
-    if (standardTree.bypass || standardTree.disableTestGenerator) {
-      return tree
-    }
-
-    return standardTree
-  },
-
-  included: function (app) {
-    var addonContext = this
-    this.app = app
-    this._super.included.apply(this, arguments)
-
-    if (app.tests) {
-      app.registry.add('js', {
-        name: 'broccoli-standard',
-        ext: 'js',
-        toTree: function (tree, inputPath, outputPath, options) {
-          var standardTree = addonContext.lintTree('unknown-type', tree)
-
-          return mergeTrees([
-            tree,
-            new Funnel(standardTree, {
-              srcDir: '/',
-              destDir: outputPath + '/tests/'
-            })
-          ], { overwrite: true })
-        }
-      })
-    }
+    });
   }
-}
+};
